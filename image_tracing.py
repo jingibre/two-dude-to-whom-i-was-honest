@@ -40,6 +40,37 @@ def generate_curve(
         steps = np.clip(steps, -3.0, 3.0)
         pts = np.cumsum(steps, axis=0)
         x, y = pts[:, 0], pts[:, 1]
+        
+    elif curve_type == "logarithmic_spiral":  # Moth around a bulb
+        theta = t * 5 * np.pi
+        r = 0.05 * np.exp(0.45 * theta)
+        x, y = r * np.cos(theta), r * np.sin(theta)
+
+    elif curve_type == "hawk_soaring":  # Looping glide drift
+        wind_drift = 3.5 * t
+        radius = 1.0
+        angle = t * 8 * np.pi
+        x = wind_drift + radius * np.cos(angle)
+        y = radius * np.sin(angle)
+
+    elif curve_type == "sunflower_fermat":  # Golden ratio plant packing
+        indices = np.arange(num_points)
+        golden_angle = np.pi * (3 - np.sqrt(5))  # ~137.5 degrees
+        theta = indices * golden_angle
+        r = np.sqrt(indices)
+        x, y = r * np.cos(theta), r * np.sin(theta)
+
+    elif curve_type == "infinity_lemniscate":  # Figure-eight
+        angle = t * 2 * np.pi
+        denom = 1 + np.sin(angle) ** 2
+        x = np.cos(angle) / denom
+        y = (np.sin(angle) * np.cos(angle)) / denom
+
+    elif curve_type == "spirograph":  # Epicycloid loops
+        R, r, d = 5.0, 3.0, 4.0
+        theta = t * 6 * np.pi
+        x = (R + r) * np.cos(theta) - d * np.cos((R + r) * theta / r)
+        y = (R + r) * np.sin(theta) - d * np.sin((R + r) * theta / r)
 
     else:
         raise ValueError(f"Unknown curve type: {curve_type}")
@@ -338,7 +369,8 @@ if __name__ == "__main__":
         min_padding=10,                      # Spacing between pictures
         canvas_size=(2400, 2400),
         density=100,
-        curve_source="rose_curve",   # 'archimedean_spiral', 'lissajous', 'rose_curve', 'bee_flight'
+        mask_file='test.png',
+        curve_source="sunflower_fermat",   # 'archimedean_spiral', 'lissajous', 'rose_curve', 'bee_flight'
         base_dim_size=100,
         norm_mode="equal_height",
         repetition_style="golden_ratio",  # constant, 'golden_ratio'
