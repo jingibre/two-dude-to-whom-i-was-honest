@@ -118,23 +118,60 @@ def extract_path_from_image(mask_path: str, num_points: int = 400) -> np.ndarray
 # -------------------------------------------------------------------------
 # 2. Metadata Extraction & Dominant Hue Calculation
 # -------------------------------------------------------------------------
-
 def get_image_datetime(file_path: Path) -> datetime:
-    """Extracts timestamp from EXIF, falling back to file creation/modification time."""
+    """
+    Extracts true camera shutter capture timestamp from EXIF metadata.
+    Prioritizes DateTimeOriginal -> DateTimeDigitized -> root DateTime -> filesystem.
+    """
+    date_candidates = []
+
     try:
         with Image.open(file_path) as img:
-            exif = img.getexif()
-            if exif:
-                for tag_id, value in exif.items():
-                    tag = ExifTags.TAGS.get(tag_id, tag_id)
-                    if tag in ("DateTimeOriginal", "DateTime"):
-                        return datetime.strptime(str(value), "%Y:%m:%d %H:%M:%S")
+            exif_data = img.getexif()
+            if exif_data:
+                # 1. Inspect Root EXIF Tags
+                for tag_id, val in exif_data.items():
+                    tag_name = ExifTags.TAGS.get(tag_id, tag_id)
+                    if tag_name in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
+                        date_candidates.append(str(val))
+
+                # 2. Inspect Nested Exif Sub-IFD (Where cameras & phones actually write capture time)
+                # 34665 corresponds to ExifOffset / Exif IFD
+                exif_ifd = exif_data.get_ifd(0x8769)
+                if exif_ifd:
+                    for tag_id, val in exif_ifd.items():
+                        tag_name = ExifTags.TAGS.get(tag_id, tag_id)
+                        if tag_name in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
+                            date_candidates.insert(0, str(val))  # Prioritize camera original
+
+        # Try parsing valid standard camera timestamp formats
+        formats_to_try = [
+            "%Y:%m:%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y:%m:%d %H:%M",
+        ]
+        for candidate in date_candidates:
+            clean_str = candidate.strip("\x00 \t\r\n")
+            for fmt in formats_to_try:
+                try:
+                    return datetime.strptime(clean_str, fmt)
+                except (ValueError, TypeError):
+                    continue
     except Exception:
         pass
-    stat = file_path.stat()
-    return datetime.fromtimestamp(stat.st_mtime)
 
-
+    # 3. macOS Fallback: Check file birthtime (creation) before modification time
+    try:
+        stat = file_path.stat()
+        birth = getattr(stat, "st_birthtime", None)  # macOS specific creation date
+        if birth:
+            return datetime.fromtimestamp(birth)
+        return datetime.fromtimestamp(stat.st_mtime)
+    except Exception:
+        return datetime.now()
+    
+    
 def get_dominant_hue(img: Image.Image) -> float:
     """Calculates dominant color hue (0.0 to 1.0) for Color Wheel Theory sorting."""
     thumb = img.convert("RGB").resize((40, 40), Image.Resampling.BOX)
