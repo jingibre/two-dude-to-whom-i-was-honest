@@ -118,10 +118,11 @@ def extract_path_from_image(mask_path: str, num_points: int = 400) -> np.ndarray
 # -------------------------------------------------------------------------
 # 2. Metadata Extraction & Dominant Hue Calculation
 # -------------------------------------------------------------------------
+
 def get_image_datetime(file_path: Path) -> datetime:
     """
-    Extracts true camera shutter capture timestamp from EXIF metadata.
-    Prioritizes DateTimeOriginal -> DateTimeDigitized -> root DateTime -> filesystem.
+    Extracts camera capture timestamp from root EXIF or nested ExifOffset IFDs.
+    Falls back to file birthtime (macOS) or modification time.
     """
     date_candidates = []
 
@@ -129,22 +130,20 @@ def get_image_datetime(file_path: Path) -> datetime:
         with Image.open(file_path) as img:
             exif_data = img.getexif()
             if exif_data:
-                # 1. Inspect Root EXIF Tags
+                # 1. Root EXIF tags
                 for tag_id, val in exif_data.items():
                     tag_name = ExifTags.TAGS.get(tag_id, tag_id)
                     if tag_name in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
                         date_candidates.append(str(val))
 
-                # 2. Inspect Nested Exif Sub-IFD (Where cameras & phones actually write capture time)
-                # 34665 corresponds to ExifOffset / Exif IFD
+                # 2. Nested Sub-IFD (Tag 34665 / 0x8769) where cameras write capture time
                 exif_ifd = exif_data.get_ifd(0x8769)
                 if exif_ifd:
                     for tag_id, val in exif_ifd.items():
                         tag_name = ExifTags.TAGS.get(tag_id, tag_id)
                         if tag_name in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
-                            date_candidates.insert(0, str(val))  # Prioritize camera original
+                            date_candidates.insert(0, str(val))
 
-        # Try parsing valid standard camera timestamp formats
         formats_to_try = [
             "%Y:%m:%d %H:%M:%S",
             "%Y-%m-%d %H:%M:%S",
@@ -161,24 +160,23 @@ def get_image_datetime(file_path: Path) -> datetime:
     except Exception:
         pass
 
-    # 3. macOS Fallback: Check file birthtime (creation) before modification time
+    # 3. Native macOS creation time fallback
     try:
         stat = file_path.stat()
-        birth = getattr(stat, "st_birthtime", None)  # macOS specific creation date
+        birth = getattr(stat, "st_birthtime", None)
         if birth:
             return datetime.fromtimestamp(birth)
         return datetime.fromtimestamp(stat.st_mtime)
     except Exception:
         return datetime.now()
-    
-    
+
+
 def get_dominant_hue(img: Image.Image) -> float:
     """Calculates dominant color hue (0.0 to 1.0) for Color Wheel Theory sorting."""
     thumb = img.convert("RGB").resize((40, 40), Image.Resampling.BOX)
     arr = np.array(thumb, dtype=float) / 255.0
     r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
 
-    # RGB to HSV Hue conversion
     c_max = np.maximum(np.maximum(r, g), b)
     c_min = np.minimum(np.minimum(r, g), b)
     delta = c_max - c_min + 1e-8
@@ -191,9 +189,8 @@ def get_dominant_hue(img: Image.Image) -> float:
     h[mask_r] = ((g[mask_r] - b[mask_r]) / delta[mask_r]) % 6
     h[mask_g] = ((b[mask_g] - r[mask_g]) / delta[mask_g]) + 2
     h[mask_b] = ((r[mask_b] - g[mask_b]) / delta[mask_b]) + 4
-    h = h / 6.0  # Normalize to [0.0, 1.0]
+    h = h / 6.0
 
-    # Weighted mean by saturation
     sat = delta / (c_max + 1e-8)
     weights = sat.flatten()
     if weights.sum() > 0:
@@ -233,7 +230,6 @@ def render_relative_text(
     annotated = img.copy()
     draw = ImageDraw.Draw(annotated)
 
-    # Relative font height
     font_size = max(10, int(annotated.height * text_ratio))
     try:
         font = ImageFont.truetype("Arial.ttf", font_size)
@@ -244,36 +240,34 @@ def render_relative_text(
     t_w = bbox[2] - bbox[0]
     t_h = bbox[3] - bbox[1]
 
-    # Position at lower center with dark backing bar
     pad = 4
     x1 = (annotated.width - t_w) // 2 - pad
     y1 = annotated.height - t_h - pad * 2 - 4
     x2 = x1 + t_w + pad * 2
     y2 = y1 + t_h + pad * 2
 
-    # Draw semi-transparent pill behind text for readability
     overlay = Image.new("RGBA", annotated.size, (0, 0, 0, 0))
     d_overlay = ImageDraw.Draw(overlay)
     d_overlay.rounded_rectangle([x1, y1, x2, y2], radius=4, fill=(0, 0, 0, 160))
     annotated = Image.alpha_composite(annotated, overlay)
 
-    # Draw Text
     draw = ImageDraw.Draw(annotated)
     draw.text(((annotated.width - t_w) // 2, y1 + pad), label, font=font, fill=(255, 255, 255, 255))
     return annotated
 
 
 # -------------------------------------------------------------------------
-# 4. Image Loader, Square Crop/Pad, & Normalization
+# 4. Image Ingestion, Recursive Traversal, & Normalization
 # -------------------------------------------------------------------------
 
 def load_and_normalize_inputs(
     folder_path: str,
     target_dim_size: int = 200,
-    norm_mode: str = "equal_height",
+    norm_mode: str = "equal_fixed_square_crop",
     render_mode: str = "images",
     text_option: str = "none",
-    text_ratio: float = 0.15
+    text_ratio: float = 0.15,
+    recursive: bool = False
 ) -> List[Dict[str, Any]]:
     folder = Path(folder_path)
 
@@ -297,27 +291,39 @@ def load_and_normalize_inputs(
             })
         return items
 
-    valid_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-    file_paths = [p for p in folder.iterdir() if p.suffix.lower() in valid_exts] if folder.exists() else []
+    # Full collection of supported photo formats including WebP
+    valid_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
+
+    if folder.exists():
+        if recursive:
+            file_paths = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in valid_exts]
+        else:
+            file_paths = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in valid_exts]
+    else:
+        file_paths = []
 
     if not file_paths:
-        raise FileNotFoundError(f"No valid image files found in '{folder_path}'")
+        raise FileNotFoundError(f"No valid image files found in '{folder_path}' (Recursive={recursive})")
 
     records = []
     for p in file_paths:
         dt = get_image_datetime(p)
-        raw_img = Image.open(p).convert("RGBA")
-        hue = get_dominant_hue(raw_img)
-        records.append({"raw": raw_img, "datetime": dt, "hue": hue, "name": p.name})
+        try:
+            raw_img = Image.open(p).convert("RGBA")
+            hue = get_dominant_hue(raw_img)
+            records.append({"raw": raw_img, "datetime": dt, "hue": hue, "name": p.name})
+        except Exception:
+            continue
+
+    if not records:
+        raise ValueError("Could not decode any valid image files from the selected path.")
 
     normalized = []
     for item in records:
         img = item["raw"]
         orig_w, orig_h = img.size
 
-        # 1. Normalization Scaling
         if norm_mode == "equal_fixed_square_crop":
-            # Crop to square, scale to target_dim_size
             min_side = min(orig_w, orig_h)
             left = (orig_w - min_side) // 2
             top = (orig_h - min_side) // 2
@@ -325,7 +331,6 @@ def load_and_normalize_inputs(
             scaled = cropped.resize((target_dim_size, target_dim_size), Image.Resampling.LANCZOS)
 
         elif norm_mode == "equal_fixed_square_pad":
-            # Scale proportionally within bounding box, expand transparent canvas
             aspect = orig_w / orig_h
             if aspect >= 1.0:
                 new_w = target_dim_size
@@ -362,7 +367,6 @@ def load_and_normalize_inputs(
         else:
             scaled = img
 
-        # 2. Text Overlay
         final_img = render_relative_text(scaled, item["datetime"], text_option, text_ratio)
 
         normalized.append({
@@ -425,7 +429,6 @@ def assign_cluster_keys(items: List[Dict[str, Any]], criterion: str) -> Dict[str
         it["_cluster_sort"] = sort_val
         clusters.setdefault(key, []).append(it)
 
-    # Sort clusters by their natural chronological/logical order
     sorted_keys = sorted(clusters.keys(), key=lambda k: clusters[k][0]["_cluster_sort"])
     return {k: clusters[k] for k in sorted_keys}
 
@@ -433,32 +436,29 @@ def assign_cluster_keys(items: List[Dict[str, Any]], criterion: str) -> Dict[str
 # -------------------------------------------------------------------------
 # 6. Placement Planning & Color Sorting
 # -------------------------------------------------------------------------
+
 def plan_placements(
     items: List[Dict[str, Any]],
     num_points: int,
     strategy: str = "unique_spread",
     repetition_style: str = "golden_ratio"
 ) -> List[Tuple[int, int]]:
-    """Generates (point_index, item_index) pairs."""
     num_items = len(items)
 
-    # 1. COLOR GRADIENT - UNIQUE (Each image used once, spread along curve by hue)
+    # Color Gradient - Unique
     if strategy == "color_gradient_unique":
-        # Sort images by hue (0.0 to 1.0)
         sorted_indices = sorted(range(num_items), key=lambda i: items[i]["hue"])
         count = min(num_items, num_points)
-        # Evenly spread points across the entire curve trajectory
         point_indices = np.linspace(0, num_points - 1, count).astype(int).tolist()
         return list(zip(point_indices, sorted_indices[:count]))
 
-    # 2. COLOR GRADIENT - REPETITION (Cycles through color wheel across all density points)
+    # Color Gradient - Repeat
     elif strategy == "color_gradient_repeat":
         sorted_indices = sorted(range(num_items), key=lambda i: items[i]["hue"])
-        # Repeatedly cycle through the sorted color spectrum
         img_seq = [sorted_indices[i % num_items] for i in range(num_points)]
         return list(zip(range(num_points), img_seq))
 
-    # 3. Standard Unique Spread
+    # Unique Spread
     elif strategy == "unique_spread":
         count = min(num_items, num_points)
         point_indices = np.linspace(0, num_points - 1, count).astype(int).tolist()
@@ -467,7 +467,7 @@ def plan_placements(
             random.shuffle(item_indices)
         return list(zip(point_indices, item_indices))
 
-    # 4. Standard Unique Sequential
+    # Unique Sequential
     elif strategy == "unique_sequential":
         count = min(num_items, num_points)
         item_indices = list(range(count))
@@ -475,7 +475,7 @@ def plan_placements(
             random.shuffle(item_indices)
         return list(zip(range(count), item_indices))
 
-    # 5. Standard Repetition
+    # Repetition
     elif strategy == "repetition":
         if repetition_style == "round_robin":
             seq = [i % num_items for i in range(num_points)]
@@ -528,6 +528,7 @@ def trace_images_on_path(
     clustering_criterion: str = "none",
     cluster_distribution: str = "grid",
     allow_overlap: bool = False,
+    recursive_search: bool = False,
     placement_strategy: str = "unique_spread",
     min_padding: int = 10,
     canvas_size: Tuple[int, int] = (2400, 2400),
@@ -543,14 +544,15 @@ def trace_images_on_path(
     text_ratio: float = 0.15,
     bg_color: Tuple[int, int, int, int] = (245, 247, 250, 0)
 ) -> Tuple[int, int]:
-    # 1. Load and process inputs
+    # Ingest and normalize
     items = load_and_normalize_inputs(
         folder_path=folder_path,
         target_dim_size=base_dim_size,
         norm_mode=norm_mode,
         render_mode=render_mode,
         text_option=text_option,
-        text_ratio=text_ratio
+        text_ratio=text_ratio,
+        recursive=recursive_search
     )
     if not items:
         return 0, 0
@@ -559,7 +561,6 @@ def trace_images_on_path(
     canvas = Image.new("RGBA", canvas_size, bg_color)
     occupancy_mask = np.zeros((c_h, c_w), dtype=bool)
 
-    # 2. Partition into clusters
     if clustering_criterion != "none":
         cluster_map = assign_cluster_keys(items, clustering_criterion)
     else:
@@ -567,7 +568,7 @@ def trace_images_on_path(
 
     num_clusters = len(cluster_map)
 
-    # 3. Compute cluster centers across the canvas
+    # Compute cell positions
     cluster_centers = []
     if num_clusters == 1:
         cluster_centers = [(c_w / 2.0, c_h / 2.0, min(c_w, c_h) * 0.42)]
@@ -601,18 +602,16 @@ def trace_images_on_path(
     total_placed = 0
     total_attempted = 0
 
-    # 4. Tracing each cluster
+    # Trace each cluster
     for c_idx, (c_key, group_items) in enumerate(cluster_map.items()):
         cx, cy, c_radius = cluster_centers[c_idx]
 
-        # Trajectory resolution
         c_density = max(10, density // num_clusters) if clustering_criterion != "none" else density
         if mask_file and mask_file.strip():
             raw_pts = extract_path_from_image(mask_file.strip(), num_points=c_density)
         else:
             raw_pts = generate_curve(curve_source, num_points=c_density, seed=42 + c_idx)
 
-        # Plan sequencing
         scheduled = plan_placements(
             items=group_items,
             num_points=c_density,
@@ -621,7 +620,6 @@ def trace_images_on_path(
         )
         total_attempted += len(scheduled)
 
-        # Map points into cluster cell coordinates
         for pt_idx, img_idx in scheduled:
             norm_x, norm_y = raw_pts[pt_idx]
             progress = pt_idx / max(1, len(raw_pts) - 1)
@@ -632,7 +630,6 @@ def trace_images_on_path(
             curr_h = max(4, int(src_img.height * mult))
             scaled_img = src_img.resize((curr_w, curr_h), Image.Resampling.LANCZOS)
 
-            # Center curve in cluster bounding circle
             px = int(cx + (norm_x - 0.5) * 2.0 * c_radius)
             py = int(cy + (norm_y - 0.5) * 2.0 * c_radius)
 
@@ -670,12 +667,13 @@ class ImageTracerGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Procedural Image Path & Cluster Studio")
-        self.geometry("580x820")
+        self.geometry("600x840")
         self.resizable(False, False)
 
         # File & Canvas
         self.var_folder = tk.StringVar(value=".")
         self.var_mask = tk.StringVar(value="")
+        self.var_recursive = tk.BooleanVar(value=False)
         self.var_output = tk.StringVar(value="traced_result.png")
         self.var_canvas = tk.IntVar(value=2400)
         self.var_density = tk.IntVar(value=300)
@@ -697,7 +695,7 @@ class ImageTracerGUI(tk.Tk):
 
         # Text Overlay
         self.var_text_opt = tk.StringVar(value="none")
-        self.var_text_ratio = tk.IntVar(value=15)  # Percentage
+        self.var_text_ratio = tk.IntVar(value=15)
 
         self._build_widgets()
 
@@ -709,12 +707,13 @@ class ImageTracerGUI(tk.Tk):
         frame_files.pack(fill="x", **pad_opts)
 
         ttk.Label(frame_files, text="Images Folder:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
-        ttk.Entry(frame_files, textvariable=self.var_folder, width=32).grid(row=0, column=1, padx=5, pady=2)
-        ttk.Button(frame_files, text="Browse...", command=self._browse_folder).grid(row=0, column=2, padx=5, pady=2)
+        ttk.Entry(frame_files, textvariable=self.var_folder, width=28).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Button(frame_files, text="Browse...", command=self._browse_folder).grid(row=0, column=2, padx=4, pady=2)
+        ttk.Checkbutton(frame_files, text="Recursive", variable=self.var_recursive).grid(row=0, column=3, padx=5, pady=2, sticky="w")
 
         ttk.Label(frame_files, text="B&W Mask File (Optional):").grid(row=1, column=0, sticky="w", padx=5, pady=2)
-        ttk.Entry(frame_files, textvariable=self.var_mask, width=32).grid(row=1, column=1, padx=5, pady=2)
-        ttk.Button(frame_files, text="Browse...", command=self._browse_mask).grid(row=1, column=2, padx=5, pady=2)
+        ttk.Entry(frame_files, textvariable=self.var_mask, width=28).grid(row=1, column=1, padx=5, pady=2)
+        ttk.Button(frame_files, text="Browse...", command=self._browse_mask).grid(row=1, column=2, padx=4, pady=2)
 
         # 2. Clustering Frame
         frame_cluster = ttk.LabelFrame(self, text="Metadata Clustering")
@@ -722,11 +721,11 @@ class ImageTracerGUI(tk.Tk):
 
         c_criteria = ["none", "month", "year", "day_of_week", "exact_day", "hour", "day_moment", "season"]
         ttk.Label(frame_cluster, text="Cluster By:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
-        ttk.Combobox(frame_cluster, textvariable=self.var_cluster_crit, values=c_criteria, state="readonly", width=22).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Combobox(frame_cluster, textvariable=self.var_cluster_crit, values=c_criteria, state="readonly", width=20).grid(row=0, column=1, padx=5, pady=2)
 
         c_dists = ["grid", "circle", "random"]
         ttk.Label(frame_cluster, text="Clusters Layout:").grid(row=0, column=2, sticky="w", padx=5, pady=2)
-        ttk.Combobox(frame_cluster, textvariable=self.var_cluster_dist, values=c_dists, state="readonly", width=12).grid(row=0, column=3, padx=5, pady=2)
+        ttk.Combobox(frame_cluster, textvariable=self.var_cluster_dist, values=c_dists, state="readonly", width=14).grid(row=0, column=3, padx=5, pady=2)
 
         # 3. Trajectory & Placement
         frame_traj = ttk.LabelFrame(self, text="Trajectory & Sequencing")
@@ -737,7 +736,7 @@ class ImageTracerGUI(tk.Tk):
             "infinity_lemniscate", "hawk_soaring", "rose_curve", "lissajous", "bee_flight"
         ]
         ttk.Label(frame_traj, text="Curve Shape:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
-        ttk.Combobox(frame_traj, textvariable=self.var_curve, values=curves, state="readonly", width=22).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Combobox(frame_traj, textvariable=self.var_curve, values=curves, state="readonly", width=20).grid(row=0, column=1, padx=5, pady=2)
 
         strategies = [
             "color_gradient_unique",
@@ -750,10 +749,10 @@ class ImageTracerGUI(tk.Tk):
         ttk.Combobox(frame_traj, textvariable=self.var_strategy, values=strategies, state="readonly", width=18).grid(row=0, column=3, padx=5, pady=2)
 
         ttk.Label(frame_traj, text="Repetition / Shuffle:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
-        ttk.Combobox(frame_traj, textvariable=self.var_rep_style, values=["golden_ratio", "round_robin", "burst_clusters", "random"], state="readonly", width=22).grid(row=1, column=1, padx=5, pady=2)
+        ttk.Combobox(frame_traj, textvariable=self.var_rep_style, values=["golden_ratio", "round_robin", "burst_clusters", "random"], state="readonly", width=20).grid(row=1, column=1, padx=5, pady=2)
 
         ttk.Label(frame_traj, text="Scale Pulse:").grid(row=1, column=2, sticky="w", padx=5, pady=2)
-        ttk.Combobox(frame_traj, textvariable=self.var_scale_var, values=["constant", "sine_wave", "bell_curve", "linear_taper"], state="readonly", width=14).grid(row=1, column=3, padx=5, pady=2)
+        ttk.Combobox(frame_traj, textvariable=self.var_scale_var, values=["constant", "sine_wave", "bell_curve", "linear_taper"], state="readonly", width=18).grid(row=1, column=3, padx=5, pady=2)
 
         # 4. Normalization & Text Overlay
         frame_style = ttk.LabelFrame(self, text="Image Sizing & Text Labels")
@@ -764,16 +763,16 @@ class ImageTracerGUI(tk.Tk):
             "equal_height", "equal_width", "proportional_max_width", "proportional_max_height"
         ]
         ttk.Label(frame_style, text="Size Normalization:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
-        ttk.Combobox(frame_style, textvariable=self.var_norm_mode, values=norms, state="readonly", width=22).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Combobox(frame_style, textvariable=self.var_norm_mode, values=norms, state="readonly", width=20).grid(row=0, column=1, padx=5, pady=2)
 
         ttk.Label(frame_style, text="Render Mode:").grid(row=0, column=2, sticky="w", padx=5, pady=2)
-        ttk.Combobox(frame_style, textvariable=self.var_render_mode, values=["images", "color_rectangles"], state="readonly", width=14).grid(row=0, column=3, padx=5, pady=2)
+        ttk.Combobox(frame_style, textvariable=self.var_render_mode, values=["images", "color_rectangles"], state="readonly", width=18).grid(row=0, column=3, padx=5, pady=2)
 
         txt_modes = ["none", "date_mm_dd_yy", "day_of_week", "month", "year", "crazy_random_words"]
         ttk.Label(frame_style, text="Text Label:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
-        ttk.Combobox(frame_style, textvariable=self.var_text_opt, values=txt_modes, state="readonly", width=22).grid(row=1, column=1, padx=5, pady=2)
+        ttk.Combobox(frame_style, textvariable=self.var_text_opt, values=txt_modes, state="readonly", width=20).grid(row=1, column=1, padx=5, pady=2)
 
-        ttk.Label(frame_style, text="Text Size (% of img):").grid(row=1, column=2, sticky="w", padx=5, pady=2)
+        ttk.Label(frame_style, text="Text Size (% img):").grid(row=1, column=2, sticky="w", padx=5, pady=2)
         ttk.Spinbox(frame_style, from_=5, to=50, increment=5, textvariable=self.var_text_ratio, width=12).grid(row=1, column=3, padx=5, pady=2)
 
         # 5. Measurements & Flags
@@ -827,7 +826,7 @@ class ImageTracerGUI(tk.Tk):
     def _browse_mask(self):
         f = filedialog.askopenfilename(
             title="Select Black & White Mask",
-            filetypes=[("Image Files", "*.png *.jpg *.jpeg *.bmp")]
+            filetypes=[("Image Files", "*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif")]
         )
         if f:
             self.var_mask.set(f)
@@ -849,6 +848,7 @@ class ImageTracerGUI(tk.Tk):
                 clustering_criterion=self.var_cluster_crit.get(),
                 cluster_distribution=self.var_cluster_dist.get(),
                 allow_overlap=self.var_overlap.get(),
+                recursive_search=self.var_recursive.get(),
                 placement_strategy=self.var_strategy.get(),
                 min_padding=self.var_padding.get(),
                 canvas_size=(c_dim, c_dim),
