@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Union, Dict, Any
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ExifTags
+from PIL import Image, ImageDraw, ImageFont, ExifTags, ImageOps
 
 # Built-in GUI modules
 import tkinter as tk
@@ -309,7 +309,10 @@ def load_and_normalize_inputs(
     for p in file_paths:
         dt = get_image_datetime(p)
         try:
-            raw_img = Image.open(p).convert("RGBA")
+            raw_img = Image.open(p)
+            # Transpose pixels to match camera sensor rotation before converting to RGBA
+            raw_img = ImageOps.exif_transpose(raw_img)
+            raw_img = raw_img.convert("RGBA")
             hue = get_dominant_hue(raw_img)
             records.append({"raw": raw_img, "datetime": dt, "hue": hue, "name": p.name})
         except Exception:
